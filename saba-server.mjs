@@ -91,4 +91,4 @@ app.post('/api/saba', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`SABA server running on port ${PORT} using ${MODEL}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`SABA server running on port ${PORT} using ${MODEL}`));
