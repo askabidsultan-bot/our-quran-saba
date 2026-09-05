@@ -65,24 +65,12 @@ function clientIp(req){
  const x=String(req.headers['x-forwarded-for']||'').split(',')[0].trim();
  return x||String(req.ip||'unknown');
 }
-function guestKey(req){
- const ip=clientIp(req).slice(0,120);
- const salt=String(process.env.GUEST_RATE_SALT||'change-this-secret').trim();
- return crypto.createHash('sha256').update(`${salt}|${ip}`).digest('hex');
-}
-function dayKey(){return new Date().toISOString().slice(0,10)}
 
-async function consumeGuest(req){
- if(!admin)return {ok:false,misconfigured:true};
- try{
-   const {data,error}=await admin.rpc('saba_consume_guest_message',{p_key:guestKey(req),p_day:dayKey(),p_limit:15});
-   if(error)throw error;
-   const row=Array.isArray(data)?data[0]:data;
-   return {ok:Boolean(row?.allowed),remaining:Number(row?.remaining??0)};
- }catch(e){
-   console.error('guest rate limit:',e?.message||e);
-   return {ok:false,misconfigured:true};
- }
+// Guest messaging is intentionally unlimited. Authentication is still supported,
+// but no daily guest message counter/RPC is required.
+async function authorizeAndLimit(req,res,id){
+ const user=await getUser(req);
+ return {user:user||null,guest:!user,guestRemaining:null};
 }
 
 const SYSTEM=`You are SABA, a polished, general-purpose AI assistant for everyone.
@@ -125,25 +113,11 @@ function requireKey(res,id){
  if(!client){res.status(503).json({ok:false,error:'SABA backend is running, but OPENAI_API_KEY is not configured.',requestId:id});return false}
  return true;
 }
-async function authorizeAndLimit(req,res,id){
- const user=await getUser(req);
- if(user)return {user,guest:false};
- const g=await consumeGuest(req);
- if(g.misconfigured){
-   res.status(503).json({ok:false,error:'SABA guest limit service is not configured. Set SUPABASE_SERVICE_ROLE_KEY and run the guest-limit SQL setup.',requestId:id});
-   return null;
- }
- if(!g.ok){
-   res.status(429).json({ok:false,error:'You’ve reached today’s 15-message limit. Sign in to continue.',guestRemaining:0,requestId:id});
-   return null;
- }
- return {user:null,guest:true,guestRemaining:g.remaining};
-}
 
-app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V22-ATTACHMENT-VISION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:Boolean(admin),visionEnabled:Boolean(client),attachmentEnabled:true}));
-app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V22-ATTACHMENT-VISION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:Boolean(admin),visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
-app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V22-ATTACHMENT-VISION',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:15,vision:true,attachments:true}}));
-app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V22-ATTACHMENT-VISION',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V23-UNLIMITED-ATTACHMENT-VISION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:false,visionEnabled:Boolean(client),attachmentEnabled:true}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V23-UNLIMITED-ATTACHMENT-VISION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:false,visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
+app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V23-UNLIMITED-ATTACHMENT-VISION',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestMessaging:'unlimited',vision:true,attachments:true}}));
+app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V23-UNLIMITED-ATTACHMENT-VISION',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20}));
 
 app.post('/api/saba',async(req,res)=>{
  const id=rid();res.set('X-SABA-Request-ID',id);
@@ -156,7 +130,7 @@ app.post('/api/saba',async(req,res)=>{
    const answer=String(response.output_text||'').trim();
    if(req.body?.attachment?.temporary&&req.body?.attachment?.file_id){try{await client.files.delete(String(req.body.attachment.file_id));}catch(cleanErr){console.warn(`[${id}] temporary file cleanup failed:`,cleanErr?.message||cleanErr)}}
    if(!answer)return res.status(502).json({ok:false,error:'SABA returned an empty response.',requestId:id});
-   res.json({ok:true,answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id});
+   res.json({ok:true,answer,guest:auth.guest,guestRemaining:null,requestId:id});
  }catch(e){
    console.error(`[${id}] /api/saba`,e?.message||e);
    const status=Number(e?.status)>=400&&Number(e?.status)<600?Number(e.status):502;
@@ -174,7 +148,7 @@ app.post('/api/saba/stream',async(req,res)=>{
    const message=String(req.body?.message||'').trim();
    if(!message){send({type:'error',error:'Message is empty.',requestId:id});return res.end()}
    const auth=await authorizeAndLimit(req,res,id);
-   if(!auth){send({type:'error',error:'You’ve reached today’s 15-message limit. Sign in to continue.',requestId:id});return res.end()}
+   if(!auth){send({type:'error',error:'Authorization failed.',requestId:id});return res.end()}
    const stream=await client.responses.create(requestOf(req.body,true));
    let answer='';
    for await(const event of stream){
@@ -182,14 +156,14 @@ app.post('/api/saba/stream',async(req,res)=>{
        const text=String(event.delta||'');if(text){answer+=text;send({type:'delta',text})}
      }else if(event.type==='response.completed'){
        if(!answer&&event.response?.output_text)answer=String(event.response.output_text);
-       send({type:'done',answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id});return res.end();
+       send({type:'done',answer,guest:auth.guest,guestRemaining:null,requestId:id});return res.end();
      }else if(event.type==='response.failed'){
        send({type:'error',error:event.response?.error?.message||'Response generation failed.',requestId:id});return res.end();
      }else if(event.type==='error'){
        send({type:'error',error:event.message||'Response generation failed.',requestId:id});return res.end();
      }
    }
-   if(answer)send({type:'done',answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id});
+   if(answer)send({type:'done',answer,guest:auth.guest,guestRemaining:null,requestId:id});
    else send({type:'error',error:'SABA returned an empty response.',requestId:id});
    res.end();
  }catch(e){
