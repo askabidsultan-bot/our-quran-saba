@@ -1,6 +1,6 @@
 {
   "name": "saba-universal-ai-server",
-  "version": "26.0.0",
+  "version": "32.0.0",
   "private": true,
   "type": "module",
   "scripts": {
