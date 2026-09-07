@@ -54,27 +54,38 @@ async function readVisualMemory(){try{return JSON.parse(await fs.readFile(VISUAL
 async function writeVisualMemory(data){await fs.mkdir(DATA_DIR,{recursive:true});await fs.writeFile(VISUAL_MEMORY_FILE,JSON.stringify(data,null,2),'utf8')}
 function memoryTokens(text){return String(text||'').toLowerCase().normalize('NFKC').split(/[^\p{L}\p{N}]+/u).filter(x=>x.length>=2)}
 function selectVisualMemories(list,query,explicitIds=[],currentChatId=''){
+ const chatId=String(currentChatId||'').trim();
+ // HARD CHAT ISOLATION: a visual memory is usable only inside the chat that created it.
+ // Never rank, select, or send memories belonging to another conversation.
+ if(!chatId)return [];
+ const scoped=list.filter(m=>String(m?.chatId||'')===chatId);
  const ids=new Set((Array.isArray(explicitIds)?explicitIds:[]).map(String));
  const qTokens=new Set(memoryTokens(query));
  const vague=/\b(photo|image|picture|pic|ছবি|ফটো|ছবিটা|ছবিটি|ছবিগুলো|ছবিগুলি)\b/i.test(String(query||''));
- return [...list].map((m,idx)=>{
-   const hay=memoryTokens([m.description,m.name,m.chatId].join(' '));
+ return scoped.map((m,idx)=>{
+   const hay=memoryTokens([m.description,m.name].join(' '));
    let score=ids.has(String(m.file_id))?1000:0;
-   if(currentChatId&&String(m.chatId||'')===String(currentChatId))score+=vague?80:8;
+   score+=vague?80:8;
    for(const t of hay)if(qTokens.has(t))score+=2;
    if(idx<8)score+=0.1;
    return {m,score,idx};
  }).sort((a,b)=>b.score-a.score).slice(0,12).map(x=>x.m);
 }
 async function buildVisualMemory(body,req){
- const cid=clientId(req),all=await readVisualMemory(),serverList=Array.isArray(all[cid])?all[cid]:[];
+ const cid=clientId(req),currentChatId=String(body?.visual_memory_chat_id||'').trim();
+ const all=await readVisualMemory(),serverList=Array.isArray(all[cid])?all[cid]:[];
  const clientRecords=Array.isArray(body?.visual_memory_records)?body.visual_memory_records.filter(x=>x&&x.file_id).map(x=>({
-   id:String(x.file_id),file_id:String(x.file_id),name:String(x.name||'uploaded photo'),mime_type:String(x.mime_type||'image/jpeg'),size:Number(x.size||0),createdAt:Number(x.createdAt||0),chatId:String(x.chatId||''),description:String(x.description||'').slice(0,5000)
+   id:String(x.file_id),file_id:String(x.file_id),name:String(x.name||'uploaded photo'),mime_type:String(x.mime_type||'image/jpeg'),size:Number(x.size||0),createdAt:Number(x.createdAt||0),chatId:String(x.chatId||currentChatId),description:String(x.description||'').slice(0,5000)
  })):[];
- const byId=new Map(serverList.map(x=>[String(x.file_id),x]));
- for(const m of clientRecords)byId.set(String(m.file_id),m);
+ const byId=new Map();
+ for(const m of serverList){
+   if(currentChatId&&String(m?.chatId||'')===currentChatId)byId.set(String(m.file_id),m);
+ }
+ for(const m of clientRecords){
+   if(currentChatId&&String(m.chatId||'')===currentChatId)byId.set(String(m.file_id),m);
+ }
  const list=[...byId.values()];
- return selectVisualMemories(list,body?.visual_memory_query||body?.message||'',body?.visual_memory_ids||clientRecords.map(x=>x.file_id),body?.visual_memory_chat_id||'');
+ return selectVisualMemories(list,body?.visual_memory_query||body?.message||'',body?.visual_memory_ids||clientRecords.map(x=>x.file_id),currentChatId);
 }
 function clientId(req){const raw=String(req.get('X-SABA-Client-ID')||req.query?.client_id||'');return /^[A-Za-z0-9_-]{8,120}$/.test(raw)?raw:'anonymous'}
 function rid(){return crypto.randomUUID()}
@@ -134,7 +145,7 @@ function historyOf(h){
 function inputOf(body,visualMemories=[]){
  const message=String(body?.message||'').trim(),input=historyOf(body?.history);
  if(Array.isArray(visualMemories)&&visualMemories.length){
-   const blocks=[{type:'input_text',text:'Persistent visual memory from photos previously uploaded by this user. Use it when relevant. These memories are retained across later messages/chats. Do not claim to remember an image unless the supplied memory supports it.'}];
+   const blocks=[{type:'input_text',text:'Persistent visual memory from photos previously uploaded by this user. Use it when relevant. These memories are retained for later messages within this same chat only. Do not claim to remember an image unless the supplied memory supports it.'}];
    for(const m of visualMemories){
      if(m?.file_id)blocks.push({type:'input_image',file_id:String(m.file_id)});
      if(m?.description)blocks.push({type:'input_text',text:`Photo memory — ${m.name||'uploaded photo'}: ${String(m.description).slice(0,5000)}`});
@@ -158,7 +169,7 @@ function instructionsOf(body){
 }
 async function requestOf(body,req,stream=false){
  const visualMemories=await buildVisualMemory(body,req);
- const memoryNote=visualMemories.length?`\nPersistent visual memory available: ${visualMemories.map(m=>m.name||'photo').join(', ')}. Use these photos and their stored descriptions when the user refers to them.`:'';
+ const memoryNote=visualMemories.length?`\nPersistent visual memory available for this chat only: ${visualMemories.map(m=>m.name||'photo').join(', ')}. Never use visual memories from another chat.`:'';
  const p={model,instructions:instructionsOf(body)+memoryNote,input:inputOf(body,visualMemories),max_output_tokens:2500};
  if(body?.web_search===true)p.tools=[{type:'web_search'}];
  if(stream)p.stream=true;
@@ -174,10 +185,10 @@ async function authorizeAndLimit(req,_res,_id){
  return {user:null,guest:true,guestRemaining:null,unlimited:true};
 }
 
-app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V32-CREATOR-LOCKED-VISUAL-MEMORY',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true}));
-app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V32-CREATOR-LOCKED-VISUAL-MEMORY',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
-app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V32-CREATOR-LOCKED-VISUAL-MEMORY',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true}}));
-app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V32-CREATOR-LOCKED-VISUAL-MEMORY',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
+app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true}}));
+app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20}));
 
 
 function isCreatorQuestion(text){
@@ -329,4 +340,4 @@ app.use((err,_req,res,_next)=>{
  return res.status(400).json({ok:false,error:'Invalid request.'});
 });
 
-app.listen(port,'0.0.0.0',()=>console.log(`SABA Universal AI V32 creator-locked persistent-visual-memory listening on 0.0.0.0:${port}`));
+app.listen(port,'0.0.0.0',()=>console.log(`SABA Universal AI V33 creator-locked chat-isolated visual-memory listening on 0.0.0.0:${port}`));

@@ -1,17 +1,1 @@
-{
-  "name": "saba-universal-ai-server",
-  "version": "32.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "node saba-server.mjs"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.57.4",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "multer": "^2.0.2",
-    "openai": "^5.20.0"
-  }
-}
+{"name":"saba-universal-ai-server","version":"33.0.0","private":true,"type":"module","scripts":{"start":"node saba-server.mjs"},"dependencies":{"@supabase/supabase-js":"^2.57.4","cors":"^2.8.5","dotenv":"^16.4.7","express":"^4.21.2","multer":"^2.0.2","openai":"^5.20.0"}}
