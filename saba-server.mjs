@@ -12,7 +12,6 @@ const app=express();
 const port=Number(process.env.PORT||3000);
 const model=String(process.env.SABA_MODEL||process.env.OPENAI_MODEL||'gpt-5.6-luna').trim();
 const transcribeModel=String(process.env.OPENAI_TRANSCRIBE_MODEL||'gpt-4o-mini-transcribe').trim();
-const imageModel=String(process.env.SABA_IMAGE_MODEL||'gpt-image-2').trim();
 const openaiKey=String(process.env.OPENAI_API_KEY||'').trim();
 const client=openaiKey?new OpenAI({apiKey:openaiKey}):null;
 
@@ -48,14 +47,10 @@ const upload=multer({
 const DATA_DIR=path.join(process.cwd(),'data');
 const PROJECTS_FILE=path.join(DATA_DIR,'projects.json');
 const FILES_INDEX_FILE=path.join(DATA_DIR,'files.json');
-const IMAGE_DIR=path.join(DATA_DIR,'generated-images');
-const IMAGES_INDEX_FILE=path.join(DATA_DIR,'images.json');
 async function readProjects(){try{return JSON.parse(await fs.readFile(PROJECTS_FILE,'utf8'))}catch{return {}}}
 async function writeProjects(data){await fs.mkdir(DATA_DIR,{recursive:true});await fs.writeFile(PROJECTS_FILE,JSON.stringify(data,null,2),'utf8')}
 async function readFilesIndex(){try{return JSON.parse(await fs.readFile(FILES_INDEX_FILE,'utf8'))}catch{return {}}}
 async function writeFilesIndex(data){await fs.mkdir(DATA_DIR,{recursive:true});await fs.writeFile(FILES_INDEX_FILE,JSON.stringify(data,null,2),'utf8')}
-async function readImagesIndex(){try{return JSON.parse(await fs.readFile(IMAGES_INDEX_FILE,'utf8'))}catch{return {}}}
-async function writeImagesIndex(data){await fs.mkdir(DATA_DIR,{recursive:true});await fs.writeFile(IMAGES_INDEX_FILE,JSON.stringify(data,null,2),'utf8')}
 function clientId(req){const raw=String(req.get('X-SABA-Client-ID')||req.query?.client_id||'');return /^[A-Za-z0-9_-]{8,120}$/.test(raw)?raw:'anonymous'}
 function rid(){return crypto.randomUUID()}
 function getToken(req){
@@ -86,49 +81,6 @@ async function consumeGuest(_req){
   // Guest chat is intentionally UNLIMITED. Keep this function for backward compatibility
   // with older integrations, but never call the old 15-message RPC.
   return {ok:true,remaining:null,unlimited:true};
-}
-
-function looksLikeImageTask(text,hasImage){
- const q=String(text||'').toLowerCase().trim();
- if(hasImage&&/(এটা|এই ছব|ছবিটা|ছবিটি|এটাকে|এটার|this|that|it|photo|image|picture|ছবি|ইমেজ)/i.test(q)&&/(বদল|পরিবর্তন|এডিট|edit|change|modify|remove|replace|add|fix|enhance|improve|upscale|background|style|color|crop|retouch|restore|4k|8k|কোয়ালিটি|মান বাড়|উন্নত|শার্প|পরিষ্কার|সুন্দর করে|ঠিক করে|সরাও|সরিয়ে|যোগ|যুক্ত|ব্যাকগ্রাউন্ড|স্টাইল|রঙ)/i.test(q))return true;
- if(/(generate|create|make|draw|design|render|illustrate|paint|image of|picture of|photo of|poster|logo|wallpaper|portrait|thumbnail|mockup|icon|banner|scene|illustration|4k|8k|upscale|enhance|high.?quality|বনাও|বানাও|তৈরি কর|তৈরি করে|ছবি বান|ইমেজ বান|জেনারেট|ছবি তৈরি|ইমেজ তৈরি|পোস্টার|লোগো|ওয়ালপেপার|পোর্ট্রেট|থাম্বনেইল|মকআপ|আইকন|ব্যানার|ইলাস্ট্রেশন|৪কে|৮কে|কোয়ালিটি বাড়|মান বাড়|উন্নত কর|শার্প কর|পরিষ্কার কর)/i.test(q))return true;
- return false;
-}
-function imageOptions(body,q=''){
- const rawSize=String(body?.image_options?.size||'auto').trim().toLowerCase();
- const qualityRaw=String(body?.image_options?.quality||'auto').trim().toLowerCase();
- const background=String(body?.image_options?.background||'auto').trim().toLowerCase();
- const format=String(body?.image_options?.output_format||'png').trim().toLowerCase();
- const compression=Number(body?.image_options?.output_compression);
- const allowedQuality=new Set(['auto','low','medium','high']);
- const allowedBg=new Set(['auto','transparent','opaque']);
- const allowedFmt=new Set(['png','jpeg','webp']);
- let size='auto';
- if(['1024x1024','1536x1024','1024x1536'].includes(rawSize))size=rawSize;
- else if(/^\d+x\d+$/.test(rawSize)){const [w,h]=rawSize.split('x').map(Number),ratio=w/h;if(w>=512&&h>=512&&w<=3840&&h<=2160&&w%16===0&&h%16===0&&ratio>=1/3&&ratio<=3)size=rawSize}
- if(size==='auto'){if(/\b(4k|uhd|3840x2160)\b|৪কে|৩৮৪০.?২১৬০/i.test(q))size='3840x2160';else if(/\b(8k|7680x4320)\b|৮কে/i.test(q))size='3840x2160';else if(/\b(square|1:1)\b|স্কোয়ার|চৌকো/i.test(q))size='1024x1024';else if(/\b(portrait|vertical|9:16|phone wallpaper)\b|পোর্ট্রেট|ভার্টিক্যাল|উল্লম্ব/i.test(q))size='1024x1536';else if(/\b(landscape|horizontal|16:9|wide|cinematic)\b|ল্যান্ডস্কেপ|হরাইজন্টাল|আড়াআড়ি|ওয়াইড|সিনেমাটিক/i.test(q))size='1536x1024'}
- let quality=allowedQuality.has(qualityRaw)?qualityRaw:'auto';if(quality==='auto'&&/\b(4k|8k|uhd|high.?quality|best quality|ultra|maximum quality)\b|৪কে|৮কে|সর্বোচ্চ মান|উচ্চ মান/i.test(q))quality='high';
- const out={size,quality,background:allowedBg.has(background)?background:'auto',output_format:allowedFmt.has(format)?format:'png',output_compression:null};
- if((out.output_format==='jpeg'||out.output_format==='webp')&&Number.isFinite(compression)&&compression>=0&&compression<=100)out.output_compression=Math.round(compression);
- return out;
-}
-function actualImageFormat(buffer){if(buffer.length>=8&&buffer.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))return {ext:'png',mime:'image/png'};if(buffer.length>=3&&buffer.subarray(0,3).equals(Buffer.from([255,216,255])))return {ext:'jpg',mime:'image/jpeg'};if(buffer.length>=12&&buffer.subarray(0,4).toString('ascii')==='RIFF'&&buffer.subarray(8,12).toString('ascii')==='WEBP')return {ext:'webp',mime:'image/webp'};return null}
-async function saveGeneratedImage(base64,meta={}){const id=crypto.randomUUID(),opts=imageOptions({image_options:meta},String(meta.prompt||'')),buffer=Buffer.from(base64,'base64'),actual=actualImageFormat(buffer),format=actual||{ext:opts.output_format==='jpeg'?'jpg':opts.output_format,mime:opts.output_format==='jpeg'?'image/jpeg':`image/${opts.output_format}`};const fileName=`${id}.${format.ext}`,filePath=path.join(IMAGE_DIR,fileName);await fs.mkdir(IMAGE_DIR,{recursive:true});await fs.writeFile(filePath,buffer);const index=await readImagesIndex();index[id]={id,fileName,filePath,mime_type:format.mime,requested_format:opts.output_format,size:opts.size,quality:opts.quality,background:opts.background,prompt:String(meta.prompt||'').slice(0,32000),createdAt:Date.now()};await writeImagesIndex(index);return index[id]}
-async function findImageRecord(id){const all=await readImagesIndex();return all[String(id)]||null}
-async function findUploadedRecord(fileId){const all=await readFilesIndex();for(const list of Object.values(all)){const hit=(Array.isArray(list)?list:[]).find(x=>String(x.file_id||x.id)===String(fileId));if(hit)return hit}return null}
-async function runImageTask(req){
- const body=req.body||{},q=String(body.message||'').trim(),ctx=body.image_context||null,att=body.attachment||null,opts=imageOptions(body,q);
- let inputPath=null,sourceName='',sourceMime='image/png';
- if(ctx?.id){const rec=await findImageRecord(ctx.id);if(rec){inputPath=rec.filePath;sourceName=rec.fileName;sourceMime=rec.mime_type||sourceMime}}
- if(!inputPath&&att?.file_id&&String(att.mime_type||'').startsWith('image/')){const rec=await findUploadedRecord(att.file_id);if(rec?.local_path){inputPath=rec.local_path;sourceName=rec.name||'uploaded-image';sourceMime=rec.mime_type||att.mime_type||sourceMime}}
- const explicitNew=/\b(new|another|different|generate|create|draw|make|design|render)\b|নতুন|আরেকটি|অন্য একটি|নতুন করে|তৈরি কর|বানাও|জেনারেট কর/i.test(q),editIntent=/(change|edit|modify|remove|replace|add|background|style|color|crop|retouch|restore|enhance|improve|upscale|পরিবর্তন|বদল|এডিট|সরাও|সরিয়ে|যোগ|যুক্ত|ব্যাকগ্রাউন্ড|স্টাইল|রঙ|উন্নত|শার্প)/i.test(q);
- if(inputPath&&explicitNew&&!editIntent){inputPath=null;sourceName='';sourceMime='image/png'}
- const isEdit=Boolean(inputPath),prompt=q||'Create the requested image.',count=Math.max(1,Math.min(4,Number(body?.image_options?.n||1)||1));
- const common={model:imageModel,prompt,size:opts.size,quality:opts.quality,background:opts.background,output_format:opts.output_format,n:count};if(opts.output_compression!==null)common.output_compression=opts.output_compression;
- let result;if(isEdit)result=await client.images.edit({model:imageModel,image:await toFile(await fs.readFile(inputPath),sourceName||'saba-image.png',{type:sourceMime}),...common});else result=await client.images.generate(common);
- const rows=Array.isArray(result?.data)?result.data:[];if(!rows.length)throw new Error('The image model returned no image data.');const images=[];
- for(const row of rows){const b64=String(row?.b64_json||'').trim();if(!b64)continue;const rec=await saveGeneratedImage(b64,{...opts,prompt});images.push({id:rec.id,url:`/api/saba/image/${encodeURIComponent(rec.id)}`,mime_type:rec.mime_type,size:rec.size,quality:rec.quality,background:rec.background,prompt,isEdit,requested_format:rec.requested_format})}
- if(!images.length)throw new Error('The image model returned empty image data.');return {...images[0],count:images.length,images};
 }
 
 const SYSTEM=`You are SABA, a polished, general-purpose AI assistant for everyone.
@@ -179,7 +131,7 @@ async function authorizeAndLimit(req,_res,_id){
 
 app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V26-VOICE-INPUT',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true}));
 app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V26-VOICE-INPUT',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
-app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V26-VOICE-INPUT',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true,voiceInput:true,transcriptionModel:transcribeModel,imageGeneration:true,imageEditing:true,imageApi:true,imageVariations:true,imageModel}}));
+app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V26-VOICE-INPUT',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true,voiceInput:true,transcriptionModel:transcribeModel}}));
 app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V26-VOICE-INPUT',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20,voiceInput:true,transcriptionModel:transcribeModel}));
 
 app.post('/api/saba/transcribe',audioUpload.single('audio'),async(req,res)=>{
@@ -201,12 +153,6 @@ app.post('/api/saba/transcribe',audioUpload.single('audio'),async(req,res)=>{
  }
 });
 
-app.post('/api/saba/image',async(req,res)=>{
- const id=rid();res.set('X-SABA-Request-ID',id);
- try{if(!requireKey(res,id))return;const auth=await authorizeAndLimit(req,res,id);if(!auth)return;const image=await runImageTask(req);res.json({ok:true,image,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id})}
- catch(e){console.error(`[${id}] /api/saba/image`,{status:e?.status,code:e?.code,message:e?.message});const status=Number(e?.status)>=400&&Number(e.status)<600?Number(e.status):502;res.status(status).json({ok:false,error:e?.message||'Image generation/editing failed. Check the backend/API configuration.',requestId:id})}
-});
-
 app.post('/api/saba',async(req,res)=>{
  const id=rid();res.set('X-SABA-Request-ID',id);
  try{
@@ -214,8 +160,6 @@ app.post('/api/saba',async(req,res)=>{
    const message=String(req.body?.message||'').trim();
    if(!message)return res.status(400).json({ok:false,error:'Message is empty.',requestId:id});
    const auth=await authorizeAndLimit(req,res,id);if(!auth)return;
-   const hasSourceImage=Boolean(req.body?.image_context?.id)||(String(req.body?.attachment?.mime_type||'').startsWith('image/')&&req.body?.attachment?.file_id);
-   if(looksLikeImageTask(message,hasSourceImage)){const image=await runImageTask(req);return res.json({ok:true,answer:'',image,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id})}
    const response=await client.responses.create(requestOf(req.body,false));
    const answer=String(response.output_text||'').trim();
    if(req.body?.attachment?.temporary&&req.body?.attachment?.file_id){try{await client.files.delete(String(req.body.attachment.file_id));}catch(cleanErr){console.warn(`[${id}] temporary file cleanup failed:`,cleanErr?.message||cleanErr)}}
@@ -272,9 +216,7 @@ app.post('/api/saba/file',upload.single('file'),async(req,res)=>{
    const uploadable=await toFile(req.file.buffer,req.file.originalname,{type:mime});
    const uploaded=await client.files.create({file:uploadable,purpose:'user_data'});
    const cid=clientId(req),temporary=String(req.query?.temporary||'')==='1';
-   let localPath='';
-   if(mime.startsWith('image/')){await fs.mkdir(path.join(DATA_DIR,'uploads'),{recursive:true});const safeName=crypto.randomUUID()+path.extname(req.file.originalname||'.png').toLowerCase();localPath=path.join(DATA_DIR,'uploads',safeName);await fs.writeFile(localPath,req.file.buffer)}
-   const meta={id:uploaded.id,file_id:uploaded.id,name:req.file.originalname,mime_type:mime,size:req.file.size,createdAt:Date.now(),temporary,local_path:localPath};
+   const meta={id:uploaded.id,file_id:uploaded.id,name:req.file.originalname,mime_type:mime,size:req.file.size,createdAt:Date.now(),temporary};
    if(!temporary){const all=await readFilesIndex(),list=all[cid]||[];all[cid]=[meta,...list].slice(0,200);await writeFilesIndex(all)}
    res.json({ok:true,...meta,file_status:uploaded.status||'uploaded',client_id:cid,requestId:id});
  }catch(e){
@@ -282,11 +224,6 @@ app.post('/api/saba/file',upload.single('file'),async(req,res)=>{
    const status=Number(e?.status)>=400&&Number(e?.status)<600?Number(e.status):502;
    res.status(status).json({ok:false,error:e?.message||'File could not be prepared. Check the backend/API configuration.',requestId:id});
  }
-});
-
-app.get('/api/saba/image/:id',async(req,res)=>{
- try{const rec=await findImageRecord(req.params.id);if(!rec)return res.status(404).end();const stat=await fs.stat(rec.filePath);res.set({'Content-Type':rec.mime_type||'image/png','Content-Length':String(stat.size),'Cache-Control':'public, max-age=31536000, immutable'});return fs.createReadStream(rec.filePath).pipe(res)}
- catch(e){console.error('generated image load',e?.message||e);return res.status(404).end()}
 });
 
 app.delete('/api/saba/files/:id',async(req,res)=>{
