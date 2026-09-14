@@ -175,6 +175,144 @@ async function requestOf(body,req,stream=false){
  if(stream)p.stream=true;
  return p;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SABA IMAGE ENGINE — additive image generation/editing layer
+// Existing chat, files, projects, visual memory and auth behavior remain intact.
+// ─────────────────────────────────────────────────────────────────────────────
+const IMAGE_MODEL=String(process.env.SABA_IMAGE_MODEL||'gpt-image-2').trim();
+const IMAGE_DEFAULT_QUALITY=String(process.env.SABA_IMAGE_QUALITY||'medium').trim().toLowerCase();
+const IMAGE_DEFAULT_SIZE=String(process.env.SABA_IMAGE_SIZE||'auto').trim();
+const IMAGE_DEFAULT_FORMAT=String(process.env.SABA_IMAGE_OUTPUT_FORMAT||'png').trim().toLowerCase();
+const IMAGE_PARTIALS=Math.max(0,Math.min(3,Number(process.env.SABA_IMAGE_PARTIALS||2)));
+
+const IMAGE_QUALITY=new Set(['low','medium','high','auto']);
+const IMAGE_SIZES=new Set(['auto','1024x1024','1536x1024','1024x1536']);
+const IMAGE_FORMATS=new Set(['png','jpeg','webp']);
+
+function normalizeImageOptions(body={}){
+  const quality=IMAGE_QUALITY.has(String(body.quality||IMAGE_DEFAULT_QUALITY).toLowerCase())
+    ? String(body.quality||IMAGE_DEFAULT_QUALITY).toLowerCase() : 'medium';
+  const size=IMAGE_SIZES.has(String(body.size||IMAGE_DEFAULT_SIZE))
+    ? String(body.size||IMAGE_DEFAULT_SIZE) : 'auto';
+  const output_format=IMAGE_FORMATS.has(String(body.output_format||IMAGE_DEFAULT_FORMAT).toLowerCase())
+    ? String(body.output_format||IMAGE_DEFAULT_FORMAT).toLowerCase() : 'png';
+  const n=Math.max(1,Math.min(1,Number(body.n||1)));
+  return {quality,size,output_format,n};
+}
+
+function dataUrlParts(value){
+  const s=String(value||'');
+  const m=s.match(/^data:([^;,]+);base64,(.+)$/s);
+  return m?{mime:m[1].toLowerCase(),base64:m[2]}:null;
+}
+
+async function fetchOpenAIFileBuffer(fileId){
+  const fid=String(fileId||'').trim();
+  if(!/^file-[A-Za-z0-9_-]+$/.test(fid))throw Object.assign(new Error('Invalid OpenAI image file ID.'),{status:400});
+  const r=await fetch(`https://api.openai.com/v1/files/${encodeURIComponent(fid)}/content`,{
+    headers:{Authorization:`Bearer ${openaiKey}`}
+  });
+  if(!r.ok){
+    const detail=await r.text().catch(()=> '');
+    throw Object.assign(new Error(detail||`Could not download OpenAI file ${fid}.`),{status:r.status});
+  }
+  const ab=await r.arrayBuffer();
+  const mime=String(r.headers.get('content-type')||'image/png').split(';')[0].trim().toLowerCase();
+  return {buffer:Buffer.from(ab),mime,name:`${fid}.${mime==='image/jpeg'?'jpg':mime==='image/webp'?'webp':'png'}`};
+}
+
+async function resolveImageInput(input,index=0){
+  const raw=typeof input==='string'?{data_url:input}:((input&&typeof input==='object')?input:{});
+  const parts=dataUrlParts(raw.data_url||raw.image_url);
+  if(parts){
+    return await toFile(Buffer.from(parts.base64,'base64'),String(raw.name||`saba-image-${index+1}.${parts.mime==='image/jpeg'?'jpg':parts.mime==='image/webp'?'webp':'png'}`),{type:parts.mime});
+  }
+  if(raw.file_id){
+    const f=await fetchOpenAIFileBuffer(raw.file_id);
+    return await toFile(f.buffer,String(raw.name||f.name),{type:String(raw.mime_type||f.mime)});
+  }
+  if(raw.buffer){
+    const b=Buffer.isBuffer(raw.buffer)?raw.buffer:Buffer.from(raw.buffer);
+    const mime=String(raw.mime_type||'image/png').toLowerCase();
+    return await toFile(b,String(raw.name||`saba-image-${index+1}.png`),{type:mime});
+  }
+  throw Object.assign(new Error(`Image ${index+1} is missing a data_url or file_id.`),{status:400});
+}
+
+function imageIntent(text){
+  const q=String(text||'').trim().toLowerCase().normalize('NFKC');
+  if(!q)return {isImage:false,action:'none'};
+  const imageWords=/(?:image|images|photo|photos|picture|pictures|pic|ছবি|ছবিটা|ছবিটি|ফটো|ফটোগ্রাফ)/i;
+  const generateWords=/(?:generate|create|make|draw|render|design|produce|generate an image|create an image|make a photo|ছবি তৈরি|ছবি বানাও|ছবি বানিয়ে|ছবি বানিয়ে|ফটো তৈরি|ফটো বানাও|ইমেজ তৈরি|ইমেজ বানাও|ছবি আঁক|ছবি তৈরি করে|ফটো বানিয়ে|ফটো বানিয়ে)/i;
+  const editWords=/(?:edit|modify|change|alter|replace|remove|add|fix|retouch|enhance|transform|background|পরিবর্তন|এডিট|সম্পাদনা|বদলে|সরিয়ে|সরিয়ে|যোগ কর|যোগ করে|ঠিক কর|সাজাও|ব্যাকগ্রাউন্ড)/i;
+  const combineWords=/(?:combine|merge|mix|blend|join|put together|একত্রিত|একসাথে|জোড়া|জোড়া|মিলিয়ে|মিলিয়ে|এক ছবিতে)/i;
+  const hasImage=imageWords.test(q);
+  if(combineWords.test(q)&&(hasImage||/দুইটা|দুটো|একাধিক|multiple|two|several/i.test(q)))return {isImage:true,action:'combine'};
+  if(editWords.test(q)&&hasImage)return {isImage:true,action:'edit'};
+  if(generateWords.test(q)&&hasImage)return {isImage:true,action:'generate'};
+  return {isImage:false,action:'none'};
+}
+
+function imagePayloadFromResponse(response,meta={}){
+  const item=response?.data?.[0]||{};
+  const b64=String(item.b64_json||'').trim();
+  if(!b64)throw new Error('Image API returned no image data.');
+  const format=String(meta.output_format||'png').toLowerCase();
+  const mime=format==='jpeg'?'image/jpeg':format==='webp'?'image/webp':'image/png';
+  return {
+    ok:true,
+    image:{
+      id:rid(),
+      data_url:`data:${mime};base64,${b64}`,
+      mime_type:mime,
+      output_format:format,
+      revised_prompt:item.revised_prompt||null
+    }
+  };
+}
+
+function imageErrorStatus(e){
+  const n=Number(e?.status);
+  return n>=400&&n<600?n:502;
+}
+
+async function createImage(body){
+  const prompt=String(body?.prompt||body?.message||'').trim();
+  if(!prompt)throw Object.assign(new Error('Image prompt is required.'),{status:400});
+  const options=normalizeImageOptions(body);
+  const request={
+    model:IMAGE_MODEL,
+    prompt,
+    size:options.size,
+    quality:options.quality,
+    output_format:options.output_format,
+    n:options.n
+  };
+  return await client.images.generate(request);
+}
+
+async function editImage(body){
+  const prompt=String(body?.prompt||body?.message||'').trim();
+  if(!prompt)throw Object.assign(new Error('Image edit instruction is required.'),{status:400});
+  const rawImages=Array.isArray(body?.images)?body.images:(body?.image?[body.image]:[]);
+  if(!rawImages.length)throw Object.assign(new Error('At least one source image is required for editing.'),{status:400});
+  if(rawImages.length>16)throw Object.assign(new Error('A maximum of 16 source images can be supplied.'),{status:400});
+  const images=[];
+  for(let i=0;i<rawImages.length;i++)images.push(await resolveImageInput(rawImages[i],i));
+  const options=normalizeImageOptions(body);
+  const request={
+    model:IMAGE_MODEL,
+    image:images.length===1?images[0]:images,
+    prompt,
+    size:options.size,
+    quality:options.quality,
+    output_format:options.output_format,
+    n:options.n
+  };
+  return await client.images.edit(request);
+}
+
 function requireKey(res,id){
  if(!client){res.status(503).json({ok:false,error:'SABA backend is running, but OPENAI_API_KEY is not configured.',requestId:id});return false}
  return true;
@@ -185,9 +323,9 @@ async function authorizeAndLimit(req,_res,_id){
  return {user:null,guest:true,guestRemaining:null,unlimited:true};
 }
 
-app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true}));
-app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,timestamp:new Date().toISOString()}));
-app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true}}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,imageGenerationEnabled:Boolean(client),imageModel:IMAGE_MODEL}));
+app.get('/health',(_req,res)=>res.json({ok:true,service:'SABA Universal AI',version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',model,keyConfigured:Boolean(client),authConfigured:Boolean(supabaseUrl&&supabaseAnonKey),guestLimitConfigured:true,visionEnabled:Boolean(client),attachmentEnabled:true,imageGenerationEnabled:Boolean(client),imageModel:IMAGE_MODEL,timestamp:new Date().toISOString()}));
+app.get('/api/saba/config',(_req,res)=>res.json({ok:true,version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',uiLanguages:['bn','en'],features:{chat:true,stream:true,files:true,projects:true,webSearch:true,auth:true,cloudHistory:true,guestDailyLimit:null,guestChatUnlimited:true,vision:true,attachments:true,imageGeneration:true,imageEditing:true,multiImageEditing:true,imageStreaming:true}}));
 app.get('/api/saba/attachment-capabilities',(_req,res)=>res.json({ok:true,version:'V33-CREATOR-LOCKED-CHAT-ISOLATION',enabled:Boolean(client),transport:'file_id',modes:['image','pdf','document','spreadsheet','text'],maxFileMb:20}));
 
 
@@ -222,7 +360,7 @@ app.post('/api/saba',async(req,res)=>{
    const answer=String(response.output_text||'').trim();
    if(req.body?.attachment?.temporary&&req.body?.attachment?.file_id){try{await client.files.delete(String(req.body.attachment.file_id));}catch(cleanErr){console.warn(`[${id}] temporary file cleanup failed:`,cleanErr?.message||cleanErr)}}
    if(!answer)return res.status(502).json({ok:false,error:'SABA returned an empty response.',requestId:id});
-   res.json({ok:true,answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id});
+   res.json({ok:true,answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id,imageIntent:imageIntent(message)});
  }catch(e){
    console.error(`[${id}] /api/saba`,e?.message||e);
    const status=Number(e?.status)>=400&&Number(e?.status)<600?Number(e.status):502;
@@ -255,7 +393,7 @@ app.post('/api/saba/stream',async(req,res)=>{
        const text=String(event.delta||'');if(text){answer+=text;send({type:'delta',text})}
      }else if(event.type==='response.completed'){
        if(!answer&&event.response?.output_text)answer=String(event.response.output_text);
-       send({type:'done',answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id});return res.end();
+       send({type:'done',answer,guest:auth.guest,guestRemaining:auth.guest?auth.guestRemaining:null,requestId:id,imageIntent:imageIntent(message)});return res.end();
      }else if(event.type==='response.failed'){
        send({type:'error',error:event.response?.error?.message||'Response generation failed.',requestId:id});return res.end();
      }else if(event.type==='error'){
@@ -270,6 +408,101 @@ app.post('/api/saba/stream',async(req,res)=>{
    send({type:'error',error:'Streaming failed. The client will retry the normal chat endpoint.',requestId:id});
    if(!res.writableEnded)res.end();
  }
+});
+
+
+// Dedicated SABA image generation endpoint.
+// Returns the completed image immediately as a data URL so the client can preview
+// it before the user chooses Download/Share.
+app.post('/api/saba/image/generate',async(req,res)=>{
+  const id=rid();res.set('X-SABA-Request-ID',id);
+  try{
+    if(!requireKey(res,id))return;
+    const prompt=String(req.body?.prompt||'').trim();
+    if(!prompt)return res.status(400).json({ok:false,error:'Image prompt is required.',requestId:id});
+    const response=await createImage(req.body);
+    const out=imagePayloadFromResponse(response,normalizeImageOptions(req.body));
+    res.json({...out,requestId:id,model:IMAGE_MODEL,action:'generate'});
+  }catch(e){
+    console.error(`[${id}] /api/saba/image/generate`,e?.message||e);
+    res.status(imageErrorStatus(e)).json({ok:false,error:e?.message||'Image generation failed.',requestId:id});
+  }
+});
+
+// Edit one image or compose multiple source images with one instruction.
+// `images` accepts objects containing `data_url` or `file_id`.
+app.post('/api/saba/image/edit',async(req,res)=>{
+  const id=rid();res.set('X-SABA-Request-ID',id);
+  try{
+    if(!requireKey(res,id))return;
+    const response=await editImage(req.body);
+    const out=imagePayloadFromResponse(response,normalizeImageOptions(req.body));
+    res.json({...out,requestId:id,model:IMAGE_MODEL,action:(Array.isArray(req.body?.images)&&req.body.images.length>1)?'combine':'edit'});
+  }catch(e){
+    console.error(`[${id}] /api/saba/image/edit`,e?.message||e);
+    res.status(imageErrorStatus(e)).json({ok:false,error:e?.message||'Image editing failed.',requestId:id});
+  }
+});
+
+// Lightweight intent detector for the normal-chat frontend.
+// It NEVER generates an image by itself.
+app.post('/api/saba/image/intent',async(req,res)=>{
+  const id=rid();res.set('X-SABA-Request-ID',id);
+  const message=String(req.body?.message||'');
+  res.json({ok:true,...imageIntent(message),requestId:id});
+});
+
+// SSE image generation with optional partial previews.
+// The frontend can display `image_partial` events immediately and replace them
+// with the final `image` event when generation completes.
+app.post('/api/saba/image/stream',async(req,res)=>{
+  const id=rid();
+  res.status(200).set({
+    'Content-Type':'text/event-stream; charset=utf-8',
+    'Cache-Control':'no-cache, no-transform',
+    'Connection':'keep-alive',
+    'X-Accel-Buffering':'no',
+    'X-SABA-Request-ID':id
+  });
+  res.flushHeaders?.();
+  const send=o=>{if(!res.writableEnded)res.write(`data: ${JSON.stringify(o)}\n\n`)};
+  try{
+    if(!client){send({type:'error',error:'SABA backend is running, but OPENAI_API_KEY is not configured.',requestId:id});return res.end()}
+    const prompt=String(req.body?.prompt||'').trim();
+    if(!prompt){send({type:'error',error:'Image prompt is required.',requestId:id});return res.end()}
+    const options=normalizeImageOptions(req.body);
+    send({type:'started',requestId:id,model:IMAGE_MODEL,action:'generate',quality:options.quality,size:options.size});
+    const stream=await client.images.generate({
+      model:IMAGE_MODEL,prompt,size:options.size,quality:options.quality,
+      output_format:options.output_format,n:options.n,stream:true,
+      partial_images:IMAGE_PARTIALS
+    });
+    let finalPayload=null;
+    for await(const event of stream){
+      const b64=String(event?.b64_json||event?.image?.b64_json||event?.data?.[0]?.b64_json||'').trim();
+      if(b64){
+        const mime=options.output_format==='jpeg'?'image/jpeg':options.output_format==='webp'?'image/webp':'image/png';
+        const payload={data_url:`data:${mime};base64,${b64}`,mime_type:mime,output_format:options.output_format};
+        if(event?.type==='image_generation.partial_image')send({type:'image_partial',...payload,index:event?.partial_image_index??null});
+        else {finalPayload=payload;send({type:'image',...payload});}
+      }
+      if(event?.type==='image_generation.completed'&&finalPayload===null){
+        const maybe=String(event?.b64_json||'').trim();
+        if(maybe){
+          const mime=options.output_format==='jpeg'?'image/jpeg':options.output_format==='webp'?'image/webp':'image/png';
+          finalPayload={data_url:`data:${mime};base64,${maybe}`,mime_type:mime,output_format:options.output_format};
+          send({type:'image',...finalPayload});
+        }
+      }
+    }
+    if(!finalPayload)send({type:'error',error:'Image generation completed without image data.',requestId:id});
+    else send({type:'done',requestId:id});
+    res.end();
+  }catch(e){
+    console.error(`[${id}] /api/saba/image/stream`,e?.message||e);
+    send({type:'error',error:e?.message||'Image generation failed.',requestId:id});
+    if(!res.writableEnded)res.end();
+  }
 });
 
 app.post('/api/saba/file',upload.single('file'),async(req,res)=>{
@@ -340,4 +573,4 @@ app.use((err,_req,res,_next)=>{
  return res.status(400).json({ok:false,error:'Invalid request.'});
 });
 
-app.listen(port,'0.0.0.0',()=>console.log(`SABA Universal AI V33 creator-locked chat-isolated visual-memory listening on 0.0.0.0:${port}`));
+app.listen(port,'0.0.0.0',()=>console.log(`SABA Universal AI V33 + SABA image engine listening on 0.0.0.0:${port}`));
