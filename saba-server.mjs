@@ -27,7 +27,7 @@ app.use(cors({
   allowedHeaders:['Content-Type','Accept','Authorization','X-SABA-Client-ID','Cache-Control'],
   exposedHeaders:['X-SABA-Request-ID']
 }));
-app.use(express.json({limit:'2mb'}));
+app.use(express.json({limit:'25mb'}));
 
 const MAX_FILE_SIZE=20*1024*1024;
 const allowedDocs=new Set([
@@ -267,9 +267,26 @@ function imagePayloadFromResponse(response,meta={}){
       data_url:`data:${mime};base64,${b64}`,
       mime_type:mime,
       output_format:format,
-      revised_prompt:item.revised_prompt||null
+      revised_prompt:item.revised_prompt||null,
+      file_id:meta.file_id||null
     }
   };
+}
+
+async function persistGeneratedImage(response,meta={}){
+  const item=response?.data?.[0]||{};
+  const b64=String(item.b64_json||'').trim();
+  if(!b64)return null;
+  const format=String(meta.output_format||'png').toLowerCase();
+  const mime=format==='jpeg'?'image/jpeg':format==='webp'?'image/webp':'image/png';
+  try{
+    const file=await toFile(Buffer.from(b64,'base64'),`saba-generated-${Date.now()}.${format==='jpeg'?'jpg':format}`,{type:mime});
+    const uploaded=await client.files.create({file,purpose:'user_data'});
+    return String(uploaded?.id||'')||null;
+  }catch(e){
+    console.warn('Generated image persistence failed:',e?.message||e);
+    return null;
+  }
 }
 
 function imageErrorStatus(e){
@@ -421,7 +438,9 @@ app.post('/api/saba/image/generate',async(req,res)=>{
     const prompt=String(req.body?.prompt||'').trim();
     if(!prompt)return res.status(400).json({ok:false,error:'Image prompt is required.',requestId:id});
     const response=await createImage(req.body);
-    const out=imagePayloadFromResponse(response,normalizeImageOptions(req.body));
+    const options=normalizeImageOptions(req.body);
+    const fileId=await persistGeneratedImage(response,options);
+    const out=imagePayloadFromResponse(response,{...options,file_id:fileId});
     res.json({...out,requestId:id,model:IMAGE_MODEL,action:'generate'});
   }catch(e){
     console.error(`[${id}] /api/saba/image/generate`,e?.message||e);
@@ -436,11 +455,33 @@ app.post('/api/saba/image/edit',async(req,res)=>{
   try{
     if(!requireKey(res,id))return;
     const response=await editImage(req.body);
-    const out=imagePayloadFromResponse(response,normalizeImageOptions(req.body));
+    const options=normalizeImageOptions(req.body);
+    const fileId=await persistGeneratedImage(response,options);
+    const out=imagePayloadFromResponse(response,{...options,file_id:fileId});
     res.json({...out,requestId:id,model:IMAGE_MODEL,action:(Array.isArray(req.body?.images)&&req.body.images.length>1)?'combine':'edit'});
   }catch(e){
     console.error(`[${id}] /api/saba/image/edit`,e?.message||e);
     res.status(imageErrorStatus(e)).json({ok:false,error:e?.message||'Image editing failed.',requestId:id});
+  }
+});
+
+// Secure image proxy for generated/reference images stored in OpenAI Files.
+// The API key stays server-side; the browser only receives image bytes.
+app.get('/api/saba/image/file/:id',async(req,res)=>{
+  const id=rid();
+  try{
+    if(!client)return res.status(503).json({ok:false,error:'OPENAI_API_KEY is not configured.',requestId:id});
+    const fileId=String(req.params.id||'').trim();
+    if(!/^file-[A-Za-z0-9_-]+$/.test(fileId))return res.status(400).json({ok:false,error:'Invalid image file ID.',requestId:id});
+    const r=await fetch(`https://api.openai.com/v1/files/${encodeURIComponent(fileId)}/content`,{headers:{Authorization:`Bearer ${openaiKey}`}});
+    if(!r.ok){const detail=await r.text().catch(()=> '');return res.status(Number(r.status)||502).json({ok:false,error:detail||'Image file could not be loaded.',requestId:id})}
+    const mime=String(r.headers.get('content-type')||'image/png').split(';')[0].trim();
+    const ab=await r.arrayBuffer();
+    res.set({'Content-Type':mime,'Cache-Control':'private, max-age=3600','X-SABA-Request-ID':id});
+    res.send(Buffer.from(ab));
+  }catch(e){
+    console.error(`[${id}] /api/saba/image/file`,e?.message||e);
+    res.status(imageErrorStatus(e)).json({ok:false,error:e?.message||'Image file could not be loaded.',requestId:id});
   }
 });
 
@@ -484,7 +525,11 @@ app.post('/api/saba/image/stream',async(req,res)=>{
         const mime=options.output_format==='jpeg'?'image/jpeg':options.output_format==='webp'?'image/webp':'image/png';
         const payload={data_url:`data:${mime};base64,${b64}`,mime_type:mime,output_format:options.output_format};
         if(event?.type==='image_generation.partial_image')send({type:'image_partial',...payload,index:event?.partial_image_index??null});
-        else {finalPayload=payload;send({type:'image',...payload});}
+        else {
+          const generatedFile=await persistGeneratedImage({data:[{b64_json:b64}]},options);
+          finalPayload={...payload,file_id:generatedFile};
+          send({type:'image',...finalPayload});
+        }
       }
       if(event?.type==='image_generation.completed'&&finalPayload===null){
         const maybe=String(event?.b64_json||'').trim();
